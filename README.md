@@ -1,3 +1,15 @@
+# VA-WAM-ICL
+
+Robot-video demonstration conditioning for [Next Forcing](https://github.com/gangweix/next-forcing).
+
+This extension adds demonstration encoding and cross-attention to the main and MCP blocks, same-task robot episode pairing for post-training, persistent demonstration context during inference, and RoboTwin A/B/C evaluation controls. The existing video, action, and MCP losses are preserved.
+
+See the [robot demonstration guide](docs/robot_demonstration.md) for data preparation, training, inference, and evaluation commands. Implementation has received static code review; full GPU training and RoboTwin validation remain to be performed. No trained demonstration-conditioned checkpoint is included.
+
+The upstream documentation follows. Its authorship, copyright notices, and [Apache 2.0 license](LICENSE.txt) are retained. Benchmark results below describe the upstream model, not this extension.
+
+---
+
 <h1 align="center">Next Forcing:<br>Causal World Modeling with Multi-Chunk Prediction</h1>
 
 <p align="center">
@@ -151,6 +163,10 @@ https://robotwin-platform.github.io/doc/usage/robotwin-install.html
 
 See [INSTALL.md](INSTALL.md) for the exact tested environment (Python 3.10,
 PyTorch 2.9.0, CUDA 12.6) and the separate RoboTwin environment setup.
+
+For the held-out robot-demonstration experiment, including the explicit
+episode registry, family split, A/B/C controls, and result aggregation, see
+[docs/robot_demonstration.md](docs/robot_demonstration.md).
 
 Run all commands below from the repository root.
 

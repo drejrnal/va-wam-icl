@@ -28,3 +28,6 @@ checkpoints/
 *.safetensors
 
 .DS_Store
+
+# Local implementation plans, review artifacts, and agent logs.
+.omo/
