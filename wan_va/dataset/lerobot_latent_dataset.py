@@ -18,6 +18,13 @@ from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 
+from .demonstration import (
+    DemonstrationRegistry,
+    load_prepared_demonstration,
+    pairable_episode_indices,
+    retain_nonempty_datasets,
+)
+
 
 DATASET_INDEX_CACHE_VERSION = 1
 
@@ -151,6 +158,7 @@ def get_relative_pose(pose):
     relative_pose = np.concatenate([relative_trans, relative_quat], axis=1)
     return torch.from_numpy(relative_pose)
 
+
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -159,14 +167,14 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     ):
         if num_init_worker is None:
             num_init_worker = getattr(config, 'init_worker', 8)
-        self._datasets = construct_lerobot_multi_processor(config, 
-                                                           num_init_worker, 
-                                                           )
+        all_datasets = construct_lerobot_multi_processor(
+            config, num_init_worker)
         self.index_cache_hits = sum(
-            dataset.index_cache_hit for dataset in self._datasets)
-        self.index_cache_misses = len(self._datasets) - self.index_cache_hits
+            dataset.index_cache_hit for dataset in all_datasets)
+        self.index_cache_misses = len(all_datasets) - self.index_cache_hits
         self.hf_cache_hits = sum(
-            dataset.hf_cache_hit for dataset in self._datasets)
+            dataset.hf_cache_hit for dataset in all_datasets)
+        self._datasets = retain_nonempty_datasets(all_datasets)
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
         )
@@ -226,7 +234,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
-        self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
+        self.empty_emb = torch.load(config.empty_emb_path, weights_only=True)
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
@@ -255,6 +263,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         if self.index_cache_hit and not self.hf_cache_hit:
             self._save_dataset_index_cache(fingerprint, self.new_metas)
+        self._configure_demonstration_pairing()
 
     def _dataset_index_fingerprint(self):
         return dataset_index_fingerprint(
@@ -421,10 +430,36 @@ class LatentLeRobotDataset(LeRobotDataset):
                 cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
             )
             assert os.path.exists(latent_file)
-            latent_data = torch.load(latent_file, weights_only=False)
+            latent_data = torch.load(latent_file, weights_only=True)
             out[key] = latent_data
         
         return self._flatten_latent_dict(out)
+
+    def _configure_demonstration_pairing(self):
+        manifest_path = getattr(self.config, 'demonstration_manifest_path', None)
+        self.enable_demo_conditioning = getattr(
+            self.config, 'enable_demo_conditioning', False)
+        self.demonstration_registry = None
+        self.demonstration_targets = {}
+        if manifest_path is None:
+            if self.enable_demo_conditioning:
+                raise RuntimeError(
+                    'demonstration_manifest_path is required when demo conditioning is enabled')
+            return
+        split = getattr(self.config, 'demonstration_split', None)
+        if not split:
+            raise RuntimeError(
+                'demonstration_split is required when using a demonstration manifest')
+        registry = DemonstrationRegistry.from_file(
+            manifest_path, required_cameras=self.used_video_keys)
+        targets = pairable_episode_indices(registry, self.root, split)
+        filtered_metas = [
+            meta for meta in self.new_metas
+            if meta['episode_index'] in targets
+        ]
+        self.new_metas = filtered_metas
+        self.demonstration_registry = registry
+        self.demonstration_targets = targets
     
         
     def _cat_video_latents(self,
@@ -511,6 +546,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
+        if self.enable_demo_conditioning:
+            target = self.demonstration_targets[episode_index]
+            reference = self.demonstration_registry.select_reference(target)
+            demonstration = load_prepared_demonstration(reference)
+            out_dict.update(demonstration.as_payload())
         return out_dict
 
     def __len__(self):

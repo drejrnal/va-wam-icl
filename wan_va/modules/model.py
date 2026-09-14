@@ -26,10 +26,15 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+from .demonstration import DemonstrationAttention, DemonstrationEncoder
+
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -302,6 +307,8 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
+            if flash_attn_func is None:
+                raise ImportError("flash-attn is required for flashattn attention mode")
             self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)
@@ -512,6 +519,17 @@ class WanTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 6, dim) / dim**0.5)
 
+    def enable_demonstration_conditioning(
+        self, attention_dim: int, num_heads: int
+    ) -> None:
+        if hasattr(self, "demo_attention"):
+            return
+        self.demo_attention = DemonstrationAttention(
+            model_dim=self.attn1.inner_dim,
+            attention_dim=attention_dim,
+            num_heads=num_heads,
+        )
+
     def forward(
         self,
         hidden_states,
@@ -520,7 +538,21 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
-    ) -> torch.Tensor:
+        demo_tokens=None,
+        demo_mask=None,
+        demo_sample_ids=None,
+        prepare_demo_cache=False,
+        use_demo_cache=False,
+    ) -> torch.Tensor | None:
+        if prepare_demo_cache:
+            self.demo_attention(
+                None,
+                demo_tokens,
+                demo_mask,
+                cache_name=cache_name,
+                prepare_cache=True,
+            )
+            return None
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
             rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
@@ -553,6 +585,18 @@ class WanTransformerBlock(nn.Module):
                                  update_cache=0,
                                  cache_name=cache_name)
         hidden_states = hidden_states + attn_output
+
+        if hasattr(self, "demo_attention") and (
+            demo_tokens is not None
+            or (use_demo_cache and self.demo_attention.has_cache(cache_name))
+        ):
+            hidden_states = hidden_states + self.demo_attention(
+                hidden_states,
+                demo_tokens,
+                demo_mask,
+                query_sample_ids=demo_sample_ids,
+                cache_name=cache_name,
+            )
 
         # 3. Feed-forward
         norm_hidden_states = (self.norm3(hidden_states.float()) *
@@ -614,7 +658,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  enable_mcp=False,
                  num_mcp_depths=3,
                  mcp_blocks_per_depth=3,
-                 mcp_hidden_collect_layers=(3, 11, 19, 29)):
+                 mcp_hidden_collect_layers=(3, 11, 19, 29),
+                 enable_demo_conditioning=False,
+                 demo_attention_dim=512,
+                 demo_num_heads=8):
         r"""
         TODO
         """
@@ -628,6 +675,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         self.attn_mode = attn_mode
+        self.in_channels = in_channels
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size,
                                       rope_max_seq_len)
         self.patch_embedding_mlp = nn.Linear(
@@ -652,12 +700,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 attn_mode=attn_mode) for _ in range(num_layers)
         ])
 
+        self.demo_conditioning_enabled = False
+        self.demo_attention_dim = demo_attention_dim
+        self.demo_num_heads = demo_num_heads
         self.enable_mcp = enable_mcp
         self.num_mcp_depths = num_mcp_depths
         self.mcp_blocks_per_depth = mcp_blocks_per_depth
         self.mcp_hidden_collect_layers = list(mcp_hidden_collect_layers)
         if self.enable_mcp:
             self._build_mcp_modules()
+
+        if enable_demo_conditioning:
+            self._build_demonstration_modules()
 
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
@@ -710,6 +764,70 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 ) for _ in range(self.mcp_blocks_per_depth)
             ]) for _ in range(self.num_mcp_depths)
         ])
+        if self.demo_conditioning_enabled:
+            for group in self.mcp_blocks:
+                for block in group:
+                    block.enable_demonstration_conditioning(
+                        self.demo_attention_dim, self.demo_num_heads
+                    )
+
+    def _build_demonstration_modules(self):
+        if self.demo_conditioning_enabled:
+            return
+        self.demo_encoder = DemonstrationEncoder(
+            in_channels=self.in_channels,
+            patch_size=self.patch_size,
+            attention_dim=self.demo_attention_dim,
+        )
+        for block in self.blocks:
+            block.enable_demonstration_conditioning(
+                self.demo_attention_dim, self.demo_num_heads
+            )
+        if self.enable_mcp:
+            for group in self.mcp_blocks:
+                for block in group:
+                    block.enable_demonstration_conditioning(
+                        self.demo_attention_dim, self.demo_num_heads
+                    )
+        self.demo_conditioning_enabled = True
+
+    def enable_demonstration_conditioning(
+        self, attention_dim=512, num_heads=8
+    ):
+        if self.demo_conditioning_enabled:
+            current = (self.demo_attention_dim, self.demo_num_heads)
+            requested = (attention_dim, num_heads)
+            if current != requested:
+                raise ValueError(
+                    f"demonstration architecture {current} does not match {requested}"
+                )
+            return False
+        self.demo_attention_dim = attention_dim
+        self.demo_num_heads = num_heads
+        self._build_demonstration_modules()
+        reference = next(self.blocks[0].parameters())
+        self.demo_encoder.to(device=reference.device, dtype=reference.dtype)
+        for block in self.blocks:
+            block.demo_attention.to(device=reference.device, dtype=reference.dtype)
+        if self.enable_mcp:
+            for group in self.mcp_blocks:
+                for block in group:
+                    block.demo_attention.to(
+                        device=reference.device, dtype=reference.dtype
+                    )
+        used_default_values = set(self.config.get("_use_default_values", []))
+        used_default_values.difference_update({
+            "enable_demo_conditioning",
+            "demo_attention_dim",
+            "demo_num_heads",
+        })
+        self.register_to_config(
+            enable_demo_conditioning=True,
+            demo_attention_dim=attention_dim,
+            demo_num_heads=num_heads,
+            _use_default_values=sorted(used_default_values),
+        )
+        return True
 
     def enable_mcp_training(self,
                             num_mcp_depths,
@@ -794,10 +912,55 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def clear_cache(self, cache_name):
         for block in self.blocks:
             block.attn1.clear_cache(cache_name)
+            if hasattr(block, "demo_attention"):
+                block.demo_attention.clear_cache(cache_name)
+        if self.enable_mcp:
+            for group in self.mcp_blocks:
+                for block in group:
+                    if hasattr(block, "demo_attention"):
+                        block.demo_attention.clear_cache(cache_name)
 
     def clear_pred_cache(self, cache_name):
         for block in self.blocks:
             block.attn1.clear_pred_cache(cache_name)
+
+    def _encode_demonstration(self, input_dict):
+        if not self.demo_conditioning_enabled or "demo_latents" not in input_dict:
+            return None, None
+        return self.demo_encoder(
+            input_dict["demo_latents"],
+            input_dict["demo_positions"],
+            input_dict["demo_mask"].to(dtype=torch.bool),
+        )
+
+    def _prepare_demonstration_cache(self, input_dict, cache_name):
+        demo_tokens, demo_mask = self._encode_demonstration(input_dict)
+        if demo_tokens is None:
+            raise RuntimeError("demonstration conditioning is not enabled")
+        for block in self.blocks:
+            block(
+                None,
+                None,
+                None,
+                None,
+                cache_name=cache_name,
+                demo_tokens=demo_tokens,
+                demo_mask=demo_mask,
+                prepare_demo_cache=True,
+            )
+        if self.enable_mcp:
+            for group in self.mcp_blocks:
+                for block in group:
+                    block(
+                        None,
+                        None,
+                        None,
+                        None,
+                        cache_name=cache_name,
+                        demo_tokens=demo_tokens,
+                        demo_mask=demo_mask,
+                        prepare_demo_cache=True,
+                    )
 
     def create_empty_cache(self, cache_name, attn_window,
                            latent_token_per_chunk, action_token_per_chunk,
@@ -852,6 +1015,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_timestep_proj,
         split_list,
         batch_size,
+        demo_tokens,
+        demo_mask,
+        demo_sample_ids,
     ):
         mcp_latent_dicts = input_dict.get('mcp_latent_dicts')
         if not self.enable_mcp or not mcp_latent_dicts:
@@ -938,6 +1104,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                     mcp_timestep_proj,
                     mcp_rotary_emb,
                     update_cache=False,
+                    demo_tokens=demo_tokens,
+                    demo_mask=demo_mask,
+                    demo_sample_ids=demo_sample_ids,
                 )
 
             previous_hidden_states = mcp_hidden_states[:, :latent_length]
@@ -978,14 +1147,24 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
 
-        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
-        action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
+        latent_by_sample = self._input_embed(
+            latent_dict['noisy_latents'], input_type='latent'
+        )
+        action_by_sample = self._input_embed(
+            action_dict['noisy_latents'], input_type='action'
+        )
+        latent_hidden_states = latent_by_sample.flatten(0, 1)[None]
+        action_hidden_states = action_by_sample.flatten(0, 1)[None]
         text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
 
         text_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
-        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
-        condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
+        condition_latent_hidden_states = self._input_embed(
+            latent_dict['latent'], input_type='latent'
+        ).flatten(0, 1)[None]
+        condition_action_hidden_states = self._input_embed(
+            action_dict['latent'], input_type='action'
+        ).flatten(0, 1)[None]
 
         hidden_states = torch.cat([latent_hidden_states, 
                                    condition_latent_hidden_states,
@@ -1025,20 +1204,32 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = F.pad(temb, (0, 0, 0, padded_length))
         timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
 
+        sample_range = torch.arange(batch_size, device=hidden_states.device)
+        demo_sample_ids = torch.cat([
+            sample_range.repeat_interleave(latent_by_sample.shape[1]),
+            sample_range.repeat_interleave(latent_by_sample.shape[1]),
+            sample_range.repeat_interleave(action_by_sample.shape[1]),
+            sample_range.repeat_interleave(action_by_sample.shape[1]),
+            torch.full(
+                (padded_length,), -1, device=hidden_states.device, dtype=torch.long
+            ),
+        ])
+        demo_tokens, demo_mask = self._encode_demonstration(input_dict)
+
         split_list = [latent_hidden_states.shape[1], 
                       condition_latent_hidden_states.shape[1], 
                       action_hidden_states.shape[1], 
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
-                               input_dict["chunk_size"],
-                               window_size=input_dict['window_size'],
-                               patch_size=self.patch_size,
-                               device=hidden_states.device
-                               )
+        if self.attn_mode == "flex":
+            FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape,
+                                   action_dict['noisy_latents'].shape,
+                                   padded_length,
+                                   input_dict["chunk_size"],
+                                   window_size=input_dict['window_size'],
+                                   patch_size=self.patch_size,
+                                   device=hidden_states.device)
 
         collected_hidden_states = {}
         for layer_id, block in enumerate(self.blocks):
@@ -1046,7 +1237,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          text_hidden_states,
                                          timestep_proj,
                                          rotary_emb,
-                                         update_cache=False)
+                                         update_cache=False,
+                                         demo_tokens=demo_tokens,
+                                         demo_mask=demo_mask,
+                                         demo_sample_ids=demo_sample_ids)
             if self.enable_mcp and layer_id in self.mcp_hidden_collect_layers:
                 collected_hidden_states[layer_id] = hidden_states
 
@@ -1067,6 +1261,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             action_timestep_proj=action_timestep_proj,
             split_list=split_list,
             batch_size=batch_size,
+            demo_tokens=demo_tokens,
+            demo_mask=demo_mask,
+            demo_sample_ids=demo_sample_ids,
         )
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
@@ -1097,6 +1294,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        prepare_demo_cache=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1117,8 +1315,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        if prepare_demo_cache:
+            self._prepare_demonstration_cache(input_dict, cache_name)
+            return None
         if train_mode:
             return self.forward_train(input_dict)
+        demo_tokens, demo_mask = self._encode_demonstration(input_dict)
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],
                                              'b c f h w -> b (f h w) c')
@@ -1156,7 +1358,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
-                                         cache_name=cache_name)
+                                         cache_name=cache_name,
+                                         demo_tokens=demo_tokens,
+                                         demo_mask=demo_mask,
+                                         use_demo_cache=demo_tokens is None)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

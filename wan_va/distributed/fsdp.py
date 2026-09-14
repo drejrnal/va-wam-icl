@@ -34,6 +34,8 @@ def shard_model(model,
     for block in model.blocks:
         fully_shard(block.attn1, **fsdp_config)
         fully_shard(block.attn2, **fsdp_config)
+        if hasattr(block, 'demo_attention'):
+            fully_shard(block.demo_attention, **fsdp_config)
         fully_shard(block.ffn, **fsdp_config)
         fully_shard(block, **fsdp_config)
 
@@ -42,8 +44,13 @@ def shard_model(model,
             for block in mcp_group:
                 fully_shard(block.attn1, **fsdp_config)
                 fully_shard(block.attn2, **fsdp_config)
+                if hasattr(block, 'demo_attention'):
+                    fully_shard(block.demo_attention, **fsdp_config)
                 fully_shard(block.ffn, **fsdp_config)
                 fully_shard(block, **fsdp_config)
+
+    if getattr(model, 'demo_conditioning_enabled', False):
+        fully_shard(model.demo_encoder, **fsdp_config)
 
     fully_shard(model, **fsdp_config)
     return model

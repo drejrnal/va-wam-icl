@@ -1,9 +1,11 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import random
 from pathlib import Path
 import wandb
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -41,6 +43,7 @@ from .utils import (
 )
 
 from .dataset import MultiLatentLeRobotDataset, dataset_indexes_ready
+from .dataset.demonstration_tensors import prepare_demonstration_conditioning
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
 import gc
 
@@ -66,6 +69,8 @@ class Trainer:
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
         self.enable_mcp = getattr(config, 'enable_mcp', True)
+        self.enable_demo_conditioning = getattr(
+            config, 'enable_demo_conditioning', False)
 
         if self.enable_mcp:
             validate_mcp_settings(
@@ -154,6 +159,12 @@ class Trainer:
                     f"{config.mcp_blocks_per_depth} blocks per depth"
                 )
 
+        if self.enable_demo_conditioning:
+            self.transformer.enable_demonstration_conditioning(
+                attention_dim=config.demo_attention_dim,
+                num_heads=config.demo_num_heads,
+            )
+
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
@@ -168,6 +179,12 @@ class Trainer:
         )
         self.transformer.train()
         self.transformer.requires_grad_(True)
+
+        process_seed = config.seed + config.rank
+        random.seed(process_seed)
+        np.random.seed(process_seed)
+        torch.manual_seed(process_seed)
+        torch.cuda.manual_seed_all(process_seed)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -233,7 +250,7 @@ class Trainer:
             num_replicas=config.world_size,
             rank=config.rank,
             shuffle=True,
-            seed=42
+            seed=config.seed
         ) if config.world_size > 1 else None
         self.train_loader = DataLoader(
             train_dataset,
@@ -363,6 +380,16 @@ class Trainer:
             'chunk_size': chunk_size,
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
+        if self.enable_demo_conditioning:
+            demonstration = prepare_demonstration_conditioning(
+                {
+                    'demo_latents': batch_dict['demo_latents'],
+                    'demo_positions': batch_dict['demo_positions'],
+                    'demo_mask': batch_dict['demo_mask'],
+                },
+                dropout_probability=self.config.demo_dropout_probability,
+            )
+            input_dict.update(demonstration)
         if self.enable_mcp:
             mcp_latent_dicts = []
             for depth in range(self.config.num_mcp_depths):
@@ -737,6 +764,9 @@ def run(args):
         'num_steps': args.num_steps,
         'save_interval': args.save_interval,
         'save_root': args.save_root,
+        'seed': args.seed,
+        'demonstration_manifest_path': args.demonstration_manifest_path,
+        'demonstration_split': args.demonstration_split,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -756,6 +786,10 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -812,6 +846,9 @@ def main():
         "--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--demonstration-manifest-path", type=str, default=None)
+    parser.add_argument("--demonstration-split", type=str, default=None)
 
     args = parser.parse_args()
     run(args)

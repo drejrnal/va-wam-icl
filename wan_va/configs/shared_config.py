@@ -15,6 +15,15 @@ va_shared_cfg.patch_size = (1, 2, 2)
 
 va_shared_cfg.enable_offload = False
 
+va_shared_cfg.enable_demo_conditioning = False
+va_shared_cfg.demo_attention_dim = 512
+va_shared_cfg.demo_num_heads = 8
+va_shared_cfg.demonstration_manifest_path = None
+va_shared_cfg.demonstration_split = None
+va_shared_cfg.demonstration_embodiment = None
+va_shared_cfg.demo_dropout_probability = 0.2
+va_shared_cfg.seed = 42
+
 # Cache the validated latent sample index so repeated training runs do not scan
 # every latent path on network storage again.
 va_shared_cfg.enable_dataset_index_cache = True
