@@ -1,5 +1,6 @@
 import sys
 import os
+import hashlib
 import subprocess
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -302,7 +303,8 @@ def get_embodiment_config(robot_file):
 
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    task_name = usr_args["task_name"]
+    trial = usr_args.get("experiment_trial")
+    task_name = usr_args["task_name"] if trial is None else trial["task"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
     save_root = usr_args["save_root"]
@@ -314,8 +316,23 @@ def main(usr_args):
     video_save_dir = None
     video_size = None
 
-    with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
-        args = yaml.load(f.read(), Loader=yaml.FullLoader)
+    task_config_path = (robotwin_root / "task_config" / f"{task_config}.yml").resolve()
+    task_config_contents = task_config_path.read_bytes()
+    args = yaml.load(task_config_contents, Loader=yaml.FullLoader)
+
+    if trial is not None:
+        randomization = args["domain_randomization"]
+        random_keys = ("cluttered_table", "random_background", "random_light", "random_table_height", "random_head_camera_dis")
+        actual_setting = "Random" if any(randomization[key] for key in random_keys) else "Clean"
+        if actual_setting != usr_args["experiment_setting"]:
+            raise RuntimeError(f"task config produces {actual_setting}, not requested {usr_args['experiment_setting']}")
+        actual_task_config = {
+            "path": str(task_config_path),
+            "sha256": hashlib.sha256(task_config_contents).hexdigest(),
+            "domain_randomization": randomization,
+        }
+        if actual_task_config != usr_args["expected_task_config"]:
+            raise RuntimeError("effective task config does not match planned task config provenance")
 
     args['task_name'] = task_name
     args["task_config"] = task_config
@@ -394,16 +411,17 @@ def main(usr_args):
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
-    seed = usr_args["seed"]
-
-    st_seed = 10000 * (1 + seed)
+    seed = usr_args["seed"] if trial is None else trial["rollout_seed"]
+    st_seed = 10000 * (1 + seed) if trial is None else seed
     suc_nums = []
-    test_num = usr_args["test_num"]
+    test_num = 1 if trial is not None else usr_args["test_num"]
+    if trial is not None:
+        Path(usr_args["result_jsonl"]).parent.mkdir(parents=True, exist_ok=True)
 
     
     model = WebsocketClientPolicy(port=usr_args['port'])
 
-    st_seed, suc_num = eval_policy(task_name,
+    st_seed, suc_num, reset_metadata = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
                                    model,
@@ -413,8 +431,27 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    save_visualization=True,
                                    video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+                                   action_guidance_scale=action_guidance_scale,
+                                   demo_id=usr_args.get("demo_id") if trial is None else trial.get("demo_id"),
+                                   demo_shuffle_seed=usr_args.get("demo_shuffle_seed") if trial is None else trial.get("demo_shuffle_seed"),
+                                   expected_checkpoint=None if trial is None else trial["expected_checkpoint"],
+                                   expected_demo_provenance=None if trial is None else trial.get("expected_demo_provenance"),
+                                   fixed_prompt=None if trial is None else trial["fixed_prompt"],
+                                   strict_seed=trial is not None)
     suc_nums.append(suc_num)
+
+    if trial is not None:
+        with open(usr_args["result_jsonl"], "a", encoding="utf-8") as result_file:
+            result_file.write(json.dumps({
+                "trial_id": trial["trial_id"], "setting": usr_args["experiment_setting"],
+                "condition": trial["condition"],
+                "success": bool(suc_num), "actual_rollout_seed": seed,
+                "actual_demo_id": None if reset_metadata.get("demo_provenance") is None else reset_metadata["demo_provenance"]["demo_id"],
+                "fixed_prompt": trial["fixed_prompt"],
+                "actual_checkpoint": reset_metadata.get("checkpoint"),
+                "actual_demo_provenance": reset_metadata.get("demo_provenance"),
+                "actual_task_config": actual_task_config,
+            }) + "\n")
 
     file_path = os.path.join(save_dir, f"_result.txt")
     with open(file_path, "w") as file:
@@ -455,7 +492,13 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                demo_id=None,
+                demo_shuffle_seed=None,
+                expected_checkpoint=None,
+                expected_demo_provenance=None,
+                fixed_prompt=None,
+                strict_seed=False):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -473,6 +516,7 @@ def eval_policy(task_name,
 
     args["eval_mode"] = True
 
+    actual_checkpoint = None
     while succ_seed < test_num:
         render_freq = args["render_freq"]
         args["render_freq"] = 0
@@ -484,11 +528,15 @@ def eval_policy(task_name,
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
+                if strict_seed:
+                    raise RuntimeError(f"planned rollout seed {now_seed} is unstable") from e
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
                 TASK_ENV.close_env()
+                if strict_seed:
+                    raise RuntimeError(f"planned rollout seed {now_seed} failed setup") from e
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
@@ -499,6 +547,8 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            if strict_seed:
+                raise RuntimeError(f"planned rollout seed {now_seed} failed expert validation")
             now_seed += 1
             args["render_freq"] = render_freq
             continue
@@ -508,7 +558,7 @@ def eval_policy(task_name,
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instruction = fixed_prompt if fixed_prompt is not None else np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -543,7 +593,13 @@ def eval_policy(task_name,
         succ = False
 
         prompt = TASK_ENV.get_instruction()
-        ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
+        reset_response = model.reset(
+            prompt=prompt,
+            demo_id=demo_id,
+            demo_shuffle_seed=demo_shuffle_seed,
+            expected_checkpoint=expected_checkpoint,
+            expected_demo_provenance=expected_demo_provenance,
+        )
         
         first = True
         full_obs_list = []
@@ -659,7 +715,7 @@ def eval_policy(task_name,
         )
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, reset_response
 
 
 def parse_args_and_config():
@@ -671,10 +727,42 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--demo-id", type=str, default=None)
+    parser.add_argument("--demo-shuffle-seed", type=int, default=None)
+    parser.add_argument("--experiment-plan", type=str, default=None)
+    parser.add_argument("--trial-id", type=str, default=None)
+    parser.add_argument("--experiment-setting", choices=("Clean", "Random"), default=None)
+    parser.add_argument("--result-jsonl", type=str, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    if args.demo_id is not None:
+        config["demo_id"] = args.demo_id
+    if args.demo_shuffle_seed is not None:
+        config["demo_shuffle_seed"] = args.demo_shuffle_seed
+    if args.experiment_plan is not None or args.trial_id is not None:
+        if args.experiment_plan is None or args.trial_id is None or args.experiment_setting is None or args.result_jsonl is None:
+            parser.error("experiment mode requires --experiment-plan, --trial-id, --experiment-setting, and --result-jsonl")
+        with open(args.experiment_plan, "r", encoding="utf-8") as plan_file:
+            plan = json.load(plan_file)
+        matches = [trial for trial in plan.get("trials", []) if trial.get("trial_id") == args.trial_id]
+        if len(matches) != 1:
+            parser.error("--trial-id must select exactly one experiment-plan row")
+        arms = {arm.get("condition"): arm.get("checkpoint") for arm in plan.get("arms", [])}
+        selected_trial = matches[0]
+        expected_checkpoint = arms.get(selected_trial.get("condition"))
+        if not isinstance(expected_checkpoint, str) or not expected_checkpoint:
+            parser.error("selected experiment-plan row has no checkpoint arm")
+        selected_trial["expected_checkpoint"] = expected_checkpoint
+        expected_task_config = plan.get("task_configs", {}).get(args.experiment_setting)
+        if not isinstance(expected_task_config, dict):
+            parser.error("experiment plan has no task config provenance for requested setting")
+        config["experiment_trial"] = selected_trial
+        config["experiment_setting"] = args.experiment_setting
+        config["result_jsonl"] = args.result_jsonl
+        config["expected_task_config"] = expected_task_config
 
     # Parse overrides
     def parse_override_pairs(pairs):

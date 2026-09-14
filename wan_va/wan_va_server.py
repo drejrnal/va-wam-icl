@@ -3,6 +3,7 @@ import argparse
 import os
 import time
 from functools import partial
+from pathlib import Path
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video
@@ -15,6 +16,16 @@ from einops import rearrange
 from tqdm import tqdm
 
 from .configs import VA_CONFIGS
+from .dataset.demonstration import (
+    DemonstrationRegistry,
+    build_demonstration_provenance,
+    load_prepared_demonstration_with_digest,
+)
+from .demonstration_inference import (
+    DemonstrationPayload,
+    prepare_demonstration_cache,
+    shuffle_temporal_content,
+)
 from .distributed.fsdp import shard_model
 from .distributed.util import _configure_model, init_distributed
 from .modules.utils import (
@@ -372,8 +383,97 @@ class VA_Server:
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
         return video_latent.to(self.device)
 
-    def _reset(self, prompt=None):
+    def _prepare_demonstration(
+        self,
+        demo_id,
+        demo_shuffle_seed=None,
+        expected_demo_provenance=None,
+    ):
+        model_config = getattr(self.transformer, "config", None)
+        if not getattr(model_config, "enable_demo_conditioning", False):
+            raise RuntimeError(
+                "demo_id requires a checkpoint with demonstration conditioning enabled"
+            )
+        manifest_path = getattr(
+            self.job_config, "demonstration_manifest_path", None
+        )
+        if manifest_path is None:
+            raise RuntimeError(
+                "demo_id requires a server-configured demonstration_manifest_path"
+            )
+        registry = DemonstrationRegistry.from_file(
+            Path(manifest_path), required_cameras=self.job_config.obs_cam_keys
+        )
+        expected_split = getattr(self.job_config, "demonstration_split", None)
+        expected_embodiment = getattr(
+            self.job_config, "demonstration_embodiment", None
+        )
+        if expected_split is None or expected_embodiment is None:
+            raise RuntimeError(
+                "demo_id requires demonstration_split and demonstration_embodiment"
+            )
+        record = registry.resolve_demo(
+            demo_id,
+            expected_split=expected_split,
+            expected_embodiment=expected_embodiment,
+        )
+        if not record.success:
+            raise RuntimeError("demonstration episode must be successful")
+        tensors, prepared_tensor_sha256 = load_prepared_demonstration_with_digest(
+            record.prepared_tensor_path, max_frames=17
+        )
+        actual_demo_provenance = build_demonstration_provenance(
+            registry, record, prepared_tensor_sha256
+        )
+        if (
+            expected_demo_provenance is not None
+            and expected_demo_provenance != actual_demo_provenance
+        ):
+            raise RuntimeError(
+                "loaded demonstration provenance does not match the planned support"
+            )
+        expected_shape = (48, 17, self.latent_height, self.latent_width)
+        if tuple(tensors.demo_latents.shape) != expected_shape:
+            raise RuntimeError(
+                f"prepared demonstration shape must be {expected_shape}"
+            )
+        payload = DemonstrationPayload(
+            demo_latents=tensors.demo_latents,
+            demo_positions=tensors.demo_positions,
+            demo_mask=tensors.demo_mask,
+        )
+        if demo_shuffle_seed is not None:
+            payload = shuffle_temporal_content(
+                payload, seed=demo_shuffle_seed
+            )
+        prepare_demonstration_cache(
+            self.transformer,
+            payload,
+            cache_name=self.cache_name,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return actual_demo_provenance
+
+    def _reset(
+        self,
+        prompt=None,
+        demo_id=None,
+        demo_shuffle_seed=None,
+        expected_checkpoint=None,
+        expected_demo_provenance=None,
+    ):
         logger.info('Reset.')
+        actual_checkpoint = str(
+            self.job_config.wan22_pretrained_model_name_or_path
+        )
+        if (
+            expected_checkpoint is not None
+            and expected_checkpoint != actual_checkpoint
+        ):
+            raise RuntimeError(
+                f"server checkpoint {actual_checkpoint} does not match planned {expected_checkpoint}"
+            )
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -424,7 +524,7 @@ class VA_Server:
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=None,
-                do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                do_classifier_free_guidance=self.use_cfg,
                 num_videos_per_prompt=1,
                 prompt_embeds=None,
                 negative_prompt_embeds=None,
@@ -436,7 +536,19 @@ class VA_Server:
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
+        actual_demo_provenance = None
+        if demo_id is not None:
+            actual_demo_provenance = self._prepare_demonstration(
+                demo_id,
+                demo_shuffle_seed,
+                expected_demo_provenance,
+            )
+        elif expected_demo_provenance is not None:
+            raise RuntimeError(
+                "expected demonstration provenance requires a demo_id"
+            )
         torch.cuda.empty_cache()
+        return actual_checkpoint, actual_demo_provenance
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
@@ -605,12 +717,27 @@ class VA_Server:
     def infer(self, obs):
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
+        demo_id = obs.get('demo_id', None)
+        demo_shuffle_seed = obs.get('demo_shuffle_seed', None)
+        expected_checkpoint = obs.get('expected_checkpoint', None)
+        expected_demo_provenance = obs.get(
+            'expected_demo_provenance', None
+        )
         compute_kv_cache = obs.get('compute_kv_cache', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
-            return dict()
+            actual_checkpoint, actual_demo_provenance = self._reset(
+                prompt=prompt,
+                demo_id=demo_id,
+                demo_shuffle_seed=demo_shuffle_seed,
+                expected_checkpoint=expected_checkpoint,
+                expected_demo_provenance=expected_demo_provenance,
+            )
+            return dict(
+                checkpoint=actual_checkpoint,
+                demo_provenance=actual_demo_provenance,
+            )
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
@@ -678,6 +805,12 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.demonstration_manifest_path is not None:
+        config.demonstration_manifest_path = args.demonstration_manifest_path
+    if args.demonstration_split is not None:
+        config.demonstration_split = args.demonstration_split
+    if args.demonstration_embodiment is not None:
+        config.demonstration_embodiment = args.demonstration_embodiment
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -718,6 +851,21 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--demonstration-manifest-path",
+        type=Path,
+        default=os.environ.get("NEXT_FORCING_DEMONSTRATION_MANIFEST"),
+    )
+    parser.add_argument(
+        "--demonstration-split",
+        type=str,
+        default=os.environ.get("NEXT_FORCING_DEMONSTRATION_SPLIT"),
+    )
+    parser.add_argument(
+        "--demonstration-embodiment",
+        type=str,
+        default=os.environ.get("NEXT_FORCING_DEMONSTRATION_EMBODIMENT"),
     )
     args = parser.parse_args()
     run(args)

@@ -55,5 +55,37 @@ class WebsocketClientPolicy:
         return unpackb(response)
 
     @override
-    def reset(self) -> None:
-        self.infer(dict(reset=True))
+    def reset(
+        self,
+        prompt: str | None = None,
+        demo_id: str | None = None,
+        demo_shuffle_seed: int | None = None,
+        expected_checkpoint: str | None = None,
+        expected_demo_provenance: Dict | None = None,
+    ) -> Dict:
+        request: Dict = {"reset": True}
+        if prompt is not None:
+            request["prompt"] = prompt
+        if demo_id is not None:
+            request["demo_id"] = demo_id
+        if demo_shuffle_seed is not None:
+            request["demo_shuffle_seed"] = demo_shuffle_seed
+        if expected_checkpoint is not None:
+            request["expected_checkpoint"] = expected_checkpoint
+        if expected_demo_provenance is not None:
+            request["expected_demo_provenance"] = expected_demo_provenance
+        response = self.infer(request)
+        if (
+            expected_checkpoint is not None
+            and response.get("checkpoint") != expected_checkpoint
+        ):
+            raise RuntimeError("inference server returned an unexpected checkpoint")
+        actual_demo_provenance = response.get("demo_provenance")
+        if demo_id is None and actual_demo_provenance is not None:
+            raise RuntimeError("inference server returned unexpected demo provenance")
+        if (
+            expected_demo_provenance is not None
+            and actual_demo_provenance != expected_demo_provenance
+        ):
+            raise RuntimeError("inference server returned unexpected demo provenance")
+        return response
